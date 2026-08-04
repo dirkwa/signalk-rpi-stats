@@ -20,6 +20,7 @@
  *   .storage.available      bytes
  *   .uptime                 s     (os.uptime)
  *   .throttling.*           bool  (vcgencmd get_throttled bit flags)
+ *   .display.backlight      ratio (/sys/class/backlight/<dev>/brightness; READ + WRITE via PUT)
  *   notifications.<prefix>.throttling  alarm on under-voltage / throttling
  *
  * Zero npm dependencies. No sudo. Reads /sys, /proc, statfs, os, and `vcgencmd`
@@ -34,6 +35,8 @@ module.exports = function (app) {
   let timer = null
   let lastCpu = null
   let lastNotif = null
+  let bl = null           // resolved backlight device: { dir, name, max }
+  let putPath = null      // path the PUT handler is registered for (guards re-registration)
 
   const plugin = {
     id: 'signalk-rpi-stats',
@@ -49,7 +52,10 @@ module.exports = function (app) {
       perCore: { type: 'boolean', title: 'Report per-core CPU utilisation', default: true },
       storageMount: { type: 'string', title: 'Filesystem to report storage for', default: '/' },
       reportThrottle: { type: 'boolean', title: 'Report throttling / under-voltage (uses vcgencmd)', default: true },
-      throttleNotify: { type: 'boolean', title: 'Raise a notification on under-voltage / throttling', default: true }
+      throttleNotify: { type: 'boolean', title: 'Raise a notification on under-voltage / throttling', default: true },
+      reportBacklight: { type: 'boolean', title: 'Report & control display backlight brightness', default: true },
+      backlightDevice: { type: 'string', title: 'Backlight device under /sys/class/backlight (blank = auto-detect)', default: '' },
+      minBacklight: { type: 'number', title: 'Minimum brightness the control allows (0-1 ratio, prevents blacking out the screen)', default: 0.05 }
     }
   }
 
@@ -58,6 +64,43 @@ module.exports = function (app) {
   }
   function sh (cmd, args) {
     return new Promise((res) => execFile(cmd, args, { timeout: 4000 }, (e, o) => res(e ? null : String(o).trim())))
+  }
+
+  // Resolve the backlight device: honour an override name, else pick the first
+  // entry under /sys/class/backlight. Reads max_brightness once. Returns null if none.
+  function resolveBacklight (override) {
+    try {
+      const base = '/sys/class/backlight'
+      const name = (override && override.trim()) ? override.trim() : (fs.readdirSync(base)[0] || '')
+      if (!name) return null
+      const dir = base + '/' + name
+      const max = parseInt(fs.readFileSync(dir + '/max_brightness', 'utf8').trim(), 10)
+      if (!max || Number.isNaN(max)) return null
+      return { dir, name, max }
+    } catch (e) { return null }
+  }
+
+  function readBacklightRatio () {
+    if (!bl) return null
+    const raw = readNum(bl.dir + '/brightness', 1)
+    if (raw == null) return null
+    return Math.max(0, Math.min(1, raw / bl.max))
+  }
+
+  // Clamp to [minRatio, 1] (floor keeps the screen visible so you can find the
+  // control again), map to 0..max, write the raw value to sysfs. No sudo: the
+  // brightness file is group-writable by `video` and Signal K runs as that user.
+  function writeBacklightRatio (ratio, minRatio) {
+    if (!bl) return { ok: false, msg: 'no backlight device' }
+    let r = Number(ratio)
+    if (Number.isNaN(r)) return { ok: false, msg: 'value is not a number' }
+    const floor = (typeof minRatio === 'number' && minRatio >= 0 && minRatio <= 1) ? minRatio : 0.05
+    r = Math.max(floor, Math.min(1, r))
+    const raw = Math.round(r * bl.max)
+    try {
+      fs.writeFileSync(bl.dir + '/brightness', String(raw))
+      return { ok: true, ratio: r, raw }
+    } catch (e) { return { ok: false, msg: e.message } }
   }
 
   function cpuUtil () {
@@ -144,6 +187,11 @@ module.exports = function (app) {
       push(p + '.storage.available', st.available)
     }
 
+    if (o.reportBacklight !== false && bl) {
+      const br = readBacklightRatio()
+      push(p + '.display.backlight', br == null ? null : +br.toFixed(3))
+    }
+
     push(p + '.uptime', Math.round(os.uptime()))
     const la = os.loadavg()
     push(p + '.cpu.load.1m', +la[0].toFixed(2))
@@ -194,10 +242,12 @@ module.exports = function (app) {
 
   plugin.start = function (options) {
     const o = Object.assign(
-      { rate: 10, prefix: 'environment.rpi', perCore: true, storageMount: '/', reportThrottle: true, throttleNotify: true },
+      { rate: 10, prefix: 'environment.rpi', perCore: true, storageMount: '/', reportThrottle: true, throttleNotify: true, reportBacklight: true, backlightDevice: '', minBacklight: 0.05 },
       options || {}
     )
     const p = o.prefix
+
+    bl = (o.reportBacklight !== false) ? resolveBacklight(o.backlightDevice) : null
     app.handleMessage(plugin.id, { updates: [{ meta: [
       { path: p + '.cpu.temperature', value: { units: 'K' } },
       { path: p + '.cpu.utilisation', value: { units: 'ratio' } },
@@ -211,8 +261,29 @@ module.exports = function (app) {
       { path: p + '.storage.capacity', value: { units: 'bytes' } },
       { path: p + '.storage.used', value: { units: 'bytes' } },
       { path: p + '.storage.available', value: { units: 'bytes' } },
-      { path: p + '.uptime', value: { units: 's' } }
+      { path: p + '.uptime', value: { units: 's' } },
+      { path: p + '.display.backlight', value: { units: 'ratio' } }
     ] }] })
+
+    // Register the PUT handler once per target path so KIP (or any client) can
+    // set brightness by writing the ratio path. Guarded so a config reload that
+    // keeps the same path does not double-register.
+    if (o.reportBacklight !== false && bl) {
+      const target = p + '.display.backlight'
+      if (putPath !== target) {
+        app.registerPutHandler('vessels.self', target, (context, path, value) => {
+          const res = writeBacklightRatio(value, o.minBacklight)
+          if (res.ok) {
+            app.handleMessage(plugin.id, { updates: [{ values: [{ path: target, value: +res.ratio.toFixed(3) }] }] })
+            return { state: 'COMPLETED', statusCode: 200 }
+          }
+          return { state: 'COMPLETED', statusCode: 400, message: res.msg }
+        })
+        putPath = target
+      }
+      app.debug && app.debug('backlight device: ' + bl.name + ' (max ' + bl.max + ')')
+    }
+
     lastCpu = null
     lastNotif = null
     poll(o)
